@@ -1,6 +1,6 @@
 (in-package #:http-dohc)
 
-(defun start-server-iolib (port &key (number-threads 50))
+(defun start-server (port &key (number-threads 50))
   (let ((leader-lock (bordeaux-threads:make-lock))
         (server-socket (iolib:listen-on
                         (iolib:make-socket :connect :passive
@@ -18,41 +18,81 @@
                    (setf client-connection (iolib:accept-connection server-socket)))
                  (ignore-errors
                    (unwind-protect
-                        (handle-request-iolib client-connection read-buffer)
+                        (handle-request client-connection read-buffer)
                      (clear read-buffer)
                      (close (iolib:shutdown client-connection :read t :write t)))))))))))
 
 (defvar *request*)
+(defvar *pages* ())
 
-(defun handle-request-iolib (client-connection read-buffer)
+(declaim (inline dispatch))
+(defun dispatch (uri-path)
+  (declare (optimize speed))
+  (aif (assoc uri-path *pages* :test #'equalp)
+       (let ((handler (cdr it)))
+         (declare (type function handler))
+         (funcall handler))))
+
+(defun handle-request (client-connection read-buffer)
   (declare (optimize speed))
   (let ((*request* (make-request :client-connection client-connection
-                                 :read-buffer read-buffer)))
+                                 :read-buffer read-buffer))
+        (keep-alive? t))
     (catch 'socket-error
-      (loop while (io.multiplex:wait-until-fd-ready (iolib:socket-os-fd client-connection) :input 5)
-         do (multiple-value-bind (method uri)
-                (read-request-line client-connection read-buffer)
-              (read-headers client-connection read-buffer))
-           (iolib:send-to
-            client-connection
-            #.(apply #'concatenate '(simple-array (unsigned-byte 8) (*))
-                     (mapcar #'cl-irregsexp.bytestrings:force-simple-byte-vector
-                             (list
-                              "HTTP/1.1 200 OK" +crlf+
-                              "Date: Fri, 31 Dec 1999 23:59:59 GMT" +crlf+
-                              "Content-Type: text/html; charset=utf8" +crlf+
-                              "Connection: Keep-Alive" +crlf+
-                              "Content-Length: 20" +crlf+ +crlf+
-                              "<h1>HARRO HARRO</h1>" +crlf+))))
-           (ensure-buffers-flushed *request*)))))
+      (loop while (and keep-alive?
+                       (io.multiplex:wait-until-fd-ready (iolib:socket-os-fd client-connection)
+                                                         :input 5))
+         do (match-bind
+                (progn method (+ #\Space) uri (+ #\Space) "HTTP/" http-version (? #\Return))
+                (read-to-newline client-connection read-buffer nil)
+              (setf (request-method *request*) method)
+              (read-headers client-connection read-buffer)
+              (match-bind (path (or (last) (progn "?" query-string)))
+                  uri
+                (setf (request-path *request*) path
+                      (request-query-string *request*) query-string)
+                (iolib:send-to client-connection (dispatch path)))
+              (if (equalp http-version #.(force-simple-byte-vector "1.0"))
+                  (setf keep-alive? nil)
+                  (ensure-buffers-flushed *request*)))))))
+
+(defmacro defpage (uri-path &body body)
+  `(push (cons ,(babel:string-to-octets uri-path) (lambda () ,@body)) *pages*))
+
+(defpage "/test"
+    (concatenate
+     'simple-byte-vector
+     #.(apply #'concatenate 'simple-byte-vector
+              (mapcar #'force-simple-byte-vector
+                      (list
+                       "HTTP/1.1 200 OK" +crlf+
+                       "Date: Fri, 31 Dec 1999 23:59:59 GMT" +crlf+
+                       "Content-Type: text/html; charset=utf8" +crlf+
+                       "Connection: Keep-Alive" +crlf+
+                       "Content-Length: 20" +crlf+ +crlf+ ;; FIXME
+                       "<h1>Hello ")))
+     (get-query-parameter #.(force-simple-byte-vector "name") *request*)
+     #.(force-simple-byte-vector "</h1>")))
 
 (defstruct request
   client-connection
   read-buffer
   method
-  uri
+  path
+  query-string
+  %query-params
   headers
   body)
+
+(defun get-query-parameter (param-name request)
+  (declare (optimize speed))
+  (unless (request-%query-params request)
+    (let ((params ()))
+      (match-bind ((* name "=" value (or (last) "&")
+                      '(push (cons (tpd2.http::url-encoding-decode name) (tpd2.http::url-encoding-decode value)) params)))
+          (request-query-string request))
+      (setf (request-%query-params request) params)))
+  (cl-irregsexp.utils:alist-get (request-%query-params request) param-name :test #'teepeedee2.lib:byte-vector=-fold-ascii-case))
 
 (defun ensure-buffers-flushed (request)
   (declare (ignore request))
@@ -62,25 +102,8 @@
 ;;     )
   )
 
-(defun read-request-line (client-connection read-buffer)
-  (let ((rline (read-to-newline client-connection read-buffer nil)))
-    (values
-     (if (and (= 80 (aref rline 0))
-              (= 79 (aref rline 1))
-              (= 83 (aref rline 2))
-              (= 84 (aref rline 3)))
-         :post
-         :get) ;; yes, I went there
-     (babel:octets-to-string rline
-                             :start (1+ (position 32 rline))
-                             :end (position 32 rline :from-end t)))))
-
 (defun read-headers (client-connection read-buffer)
-  (read-to-newline client-connection read-buffer t)
-  ;; (loop for line = (read-to-delimiter client-connection read-buffer +lf+)
-;;        until (< (length line) 2)
-;;        collect line)
-  )
+  (read-to-newline client-connection read-buffer t))
 
 ;; (defun read-body (request)
 ;;   )

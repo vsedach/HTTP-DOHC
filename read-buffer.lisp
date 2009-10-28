@@ -2,7 +2,7 @@
 
 ;; some of this code is borrowed from TPD2, Lisp LGPL licensed
 
-(defvar +crlf+ (cl-irregsexp.bytestrings:force-simple-byte-vector #(13 10)))
+(defvar +crlf+ (force-simple-byte-vector #(13 10)))
 (defconstant +lf+ 10)
 (defconstant +cr+ 13)
 
@@ -99,4 +99,3 @@
       (error "Error reading request body"))
     (incf (rbuf-end buf) bytes-read)
     (make-displaced-byte-vector buffer (rbuf-start buf) (rbuf-end buf))))
-
