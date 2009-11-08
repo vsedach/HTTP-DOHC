@@ -39,22 +39,22 @@
                                  :read-buffer read-buffer))
         (keep-alive? t))
     (catch 'socket-error
-      (loop while (and keep-alive?
-                       (io.multiplex:wait-until-fd-ready (iolib:socket-os-fd client-connection)
-                                                         :input 5))
-         do (match-bind
-                (progn method (+ #\Space) uri (+ #\Space) "HTTP/" http-version (? #\Return))
-                (read-to-newline client-connection read-buffer nil)
-              (setf (request-method *request*) method)
-              (read-headers client-connection read-buffer)
-              (match-bind (path (or (last) (progn "?" query-string)))
-                  uri
-                (setf (request-path *request*) path
-                      (request-query-string *request*) query-string)
-                (iolib:send-to client-connection (dispatch path)))
-              (if (equalp http-version #.(force-simple-byte-vector "1.0"))
-                  (setf keep-alive? nil)
-                  (ensure-buffers-flushed *request*)))))))
+      (loop do (match-bind
+                   (progn method (+ #\Space) uri (+ #\Space) "HTTP/" http-version (? #\Return))
+                   (read-to-newline client-connection read-buffer nil)
+                 (setf (request-method *request*) method)
+                 (read-headers client-connection read-buffer)
+                 (match-bind (path (or (last) (progn "?" query-string)))
+                     uri
+                   (setf (request-path *request*) path
+                         (request-query-string *request*) query-string)
+                   (iolib:send-to client-connection (dispatch path)))
+                 (if (equalp http-version #.(force-simple-byte-vector "1.0"))
+                     (setf keep-alive? nil)
+                     (ensure-buffers-flushed *request*)))
+         while (and keep-alive?
+                    (io.multiplex:wait-until-fd-ready (iolib:socket-os-fd client-connection)
+                                                      :input 5))))))
 
 (defmacro defpage (uri-path &body body)
   `(push (cons ,(babel:string-to-octets uri-path) (lambda () ,@body)) *pages*))
