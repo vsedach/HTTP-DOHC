@@ -53,8 +53,8 @@
                      (setf keep-alive? nil)
                      (ensure-buffers-flushed *request*)))
          while (and keep-alive?
-                    (io.multiplex:wait-until-fd-ready (iolib:socket-os-fd client-connection)
-                                                      :input 5))))))
+                    (iomux:wait-until-fd-ready (iolib:fd-of client-connection)
+                                               :input 5))))))
 
 (defmacro defpage (uri-path &body body)
   `(push (cons ,(babel:string-to-octets uri-path) (lambda () ,@body)) *pages*))
@@ -89,10 +89,13 @@
   (unless (request-%query-params request)
     (let ((params ()))
       (match-bind ((* name "=" value (or (last) "&")
-                      '(push (cons (tpd2.http::url-encoding-decode name) (tpd2.http::url-encoding-decode value)) params)))
+                      '(push (cons (url-encoding-decode name)
+                                   (url-encoding-decode value))
+                        params)))
           (request-query-string request))
       (setf (request-%query-params request) params)))
-  (cl-irregsexp.utils:alist-get (request-%query-params request) param-name :test #'teepeedee2.lib:byte-vector=-fold-ascii-case))
+  (cl-irregsexp.utils:alist-get (request-%query-params request) param-name
+                                :test #'byte-vector=))
 
 (defun ensure-buffers-flushed (request)
   (declare (ignore request))

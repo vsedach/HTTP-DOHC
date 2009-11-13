@@ -9,7 +9,7 @@
 (defvar *read-buffer-size* 1024)
 
 (defstruct rbuf
-  (buffer (make-array (* 10 *read-buffer-size*) :element-type '(unsigned-byte 8)))
+  (buffer (make-array (* 2 *read-buffer-size*) :element-type '(unsigned-byte 8)))
   (start 0 :type fixnum)
   (end 0 :type fixnum))
 
@@ -25,13 +25,6 @@
                                (= +lf+ (aref seq (incf i))))))
              (return i)))
       (position +lf+ seq :start start :end end)))
-
-(declaim (inline make-displaced-byte-vector))
-(defun make-displaced-byte-vector (v start end)
-  (make-array (- end start)
-              :element-type '(unsigned-byte 8)
-              :displaced-to v
-              :displaced-index-offset start))
 
 (declaim (inline clear))
 (defun clear (buffer)
@@ -66,27 +59,34 @@
   (let ((buffer (rbuf-buffer buf)))
     (declare (type simple-byte-vector buffer))
     (awhen (find-newline buffer (rbuf-start buf) (rbuf-end buf) two-newlines?)
-      (prog1 (make-displaced-byte-vector buffer (rbuf-start buf) it)
+      (prog1 (subseq buffer (rbuf-start buf) it)
         (setf (rbuf-start buf) (1+ it))
         (sync buf)))))
 
-(defun recv (socket buf)
-  (declare (optimize speed))
-  (multiple-value-bind (buffer bytes-read)
-      (iolib:receive-from socket
-                          :buffer (rbuf-buffer buf)
-                          :start (rbuf-end buf))
-    (declare (ignore buffer) (type fixnum bytes-read))
-    (when (< bytes-read 1)
-      (throw 'socket-error nil))
-    (incf (rbuf-end buf) bytes-read)))
+(declaim (inline %read)
+         (ftype (function (t t t) fixnum) %read))
+(cffi:defcfun ("read" %read) :int
+  (fd :int)
+  (buf :pointer)
+  (size :unsigned-long))
+
+(defun recv (fd buffer offset)
+  (declare (optimize speed (safety 0))
+           (type fixnum offset)
+           (type simple-byte-vector buffer))
+  (the fixnum
+    (cffi:with-pointer-to-vector-data (buf-ptr buffer)
+      (%read fd
+             (cffi:inc-pointer buf-ptr offset)
+             (- (length buffer) offset)))))
 
 (defun read-to-newline (socket buf two-newlines?)
   (declare (optimize speed))
   (loop (aif (eat-to-newline buf two-newlines?)
              (return it)
              (progn (prepare-read buf)
-                    (recv socket buf)))))
+                    (incf (rbuf-end buf)
+                          (recv (iolib:fd-of socket) (rbuf-buffer buf) (rbuf-end buf)))))))
 
 (defun read-body (socket buf size)
   (prepare-read buf size)
@@ -98,4 +98,19 @@
     (when (/= size bytes-read) ;; FIXME
       (error "Error reading request body"))
     (incf (rbuf-end buf) bytes-read)
-    (make-displaced-byte-vector buffer (rbuf-start buf) (rbuf-end buf))))
+    (subseq buffer (rbuf-start buf) (rbuf-end buf))))
+
+(defun url-encoding-decode (encoded)
+  (declare (type simple-byte-vector encoded))
+  (match-replace-all 
+      encoded
+    ((progn "%" (val (unsigned-byte :length 2 :base 16)))
+     (make-array 1 :element-type '(unsigned-byte 8) :initial-element val))
+    ("+" " ")))
+
+(declaim (inline byte-vector=-fold-ascii-case))
+(defun byte-vector= (a b)
+  (declare (optimize speed) (type simple-byte-vector a b))
+  (and (= (length a) (length b))
+       (loop for i from 0 below (length a)
+          always (= (aref a i) (aref b i)))))

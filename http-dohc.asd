@@ -5,4 +5,4 @@
   :components ((:file "package")
                (:file "read-buffer")
                (:file "server"))
-  :depends-on (:iolib :bordeaux-threads :cl-irregsexp :anaphora :babel :teepeedee2))
+  :depends-on (:iolib :bordeaux-threads :cl-irregsexp :anaphora :babel))
