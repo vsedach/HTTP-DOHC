@@ -8,8 +8,22 @@
 
 (defvar *read-buffer-size* 1024)
 
+(defvar *read-buffer-pool* ())
+(defvar *read-buffer-pool-lock* (make-lock))
+
+(defun make-read-buffer ()
+  (aif (with-lock-held (*read-buffer-pool-lock*)
+         (pop *read-buffer-pool*))
+       it
+       (make-rbuf)))
+
+(defun free-read-buffer (buf)
+  (clear buf)
+  (with-lock-held (*read-buffer-pool-lock*)
+    (push buf *read-buffer-pool*)))
+
 (defstruct rbuf
-  (buffer (make-array (* 2 *read-buffer-size*) :element-type '(unsigned-byte 8)))
+  (buffer (make-array *read-buffer-size* :element-type '(unsigned-byte 8)))
   (start 0 :type fixnum)
   (end 0 :type fixnum))
 
