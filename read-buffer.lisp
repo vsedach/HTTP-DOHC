@@ -77,22 +77,17 @@
         (setf (rbuf-start buf) (1+ it))
         (sync buf)))))
 
-(declaim (inline %read)
-         (ftype (function (t t t) fixnum) %read))
-(cffi:defcfun ("read" %read) :int
-  (fd :int)
-  (buf :pointer)
-  (size :unsigned-long))
-
 (defun recv (fd buffer offset)
   (declare (optimize speed (safety 0))
            (type fixnum offset)
-           (type simple-byte-vector buffer))
+           (type simple-byte-vector buffer)
+           (inline isys:%sys-read)
+           (ftype (function (t t t) fixnum) isys:%sys-read))
   (the fixnum
     (cffi:with-pointer-to-vector-data (buf-ptr buffer)
-      (%read fd
-             (cffi:inc-pointer buf-ptr offset)
-             (- (length buffer) offset)))))
+      (isys:%sys-read fd
+                      (cffi:inc-pointer buf-ptr offset)
+                      (- (length buffer) offset)))))
 
 (defun read-to-newline (socket buf two-newlines?)
   (declare (optimize speed))
@@ -100,7 +95,7 @@
              (return it)
              (progn (prepare-read buf)
                     (incf (rbuf-end buf)
-                          (recv (iolib:fd-of socket) (rbuf-buffer buf) (rbuf-end buf)))))))
+                          (recv socket (rbuf-buffer buf) (rbuf-end buf)))))))
 
 (defun read-body (socket buf size)
   (prepare-read buf size)

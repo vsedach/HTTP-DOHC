@@ -1,26 +1,96 @@
 (in-package #:http-dohc)
 
+(defvar *default-connection-timeout* 5 "seconds")
+
 (defun start-server (port &key (number-threads 50))
-  (let ((leader-lock (bordeaux-threads:make-lock))
-        (server-socket (iolib:listen-on
-                        (iolib:make-socket :connect :passive
-                                           :ipv6 nil
-                                           :local-host iolib:+ipv4-unspecified+
-                                           :local-port port))))
-    (loop repeat number-threads do
-         (bordeaux-threads:make-thread
-          (lambda ()
-            (declare (optimize speed))
-            (let ((read-buffer (make-rbuf))
-                  client-connection)
-              (loop
-                 (bordeaux-threads:with-lock-held (leader-lock)
-                   (setf client-connection (iolib:accept-connection server-socket)))
-                 (ignore-errors
-                   (unwind-protect
-                        (handle-request client-connection read-buffer)
-                     (clear read-buffer)
-                     (close (iolib:shutdown client-connection :read t :write t)))))))))))
+  (let ((server-socket (iolib:fd-of
+                        (iolib:listen-on
+                         (iolib:make-socket
+                          :connect :passive
+                          :ipv6 nil
+                          :local-host iolib:+ipv4-unspecified+
+                          :local-port port))))
+        (accept-leader-lock (make-lock))
+        (mux-leader-lock (make-lock))
+        (waiting-fds-lock (make-lock))
+        (waiting-fds (make-hash-table))
+        (io-tasks ())
+        (mux (make-instance iomux:*default-multiplexer*))
+        (last-cull-time (get-universal-time)))
+    (declare (ignorable accept-leader-lock))
+    (flet ((close-epoll-connection (fd)
+             (iomux:unmonitor-fd mux fd)
+             (ignore-errors (isys:%sys-close fd))))
+      (loop repeat number-threads do
+           (make-thread ;; accept() thread pool
+            (lambda ()
+              (declare (optimize speed)
+                       (ftype (function (t t t) fixnum) sockets::%accept)
+                       (inline sockets::%accept))
+              (let ((read-buffer (make-rbuf))
+                    fd)
+                (loop ;; accept() is thread-safe on Linux
+                   #-linux (acquire-lock accept-leader-lock)
+                   (setf fd (sockets::%accept server-socket
+                                              (cffi:null-pointer)
+                                              (cffi:null-pointer)))
+                   #-linux (release-lock accept-leader-lock)
+                   (ignore-errors
+                     (if (handle-request fd read-buffer)
+                         (progn
+                           (with-lock-held (waiting-fds-lock)
+                             (setf (gethash fd waiting-fds)
+                                   (cons (get-universal-time) read-buffer)))
+                           (iomux:monitor-fd mux fd '(:read :epoll-oneshot))
+                           (setf read-buffer (make-read-buffer)))
+                         (progn (isys:%sys-close fd)
+                                (clear read-buffer))))))))
+           (make-thread ;; epoll thread pool
+            (lambda ()
+              (let (my-task
+                    fd-buffer)
+                (loop (with-lock-held (mux-leader-lock)
+                        ;; this assumes thread safety in adding events
+                        ;; to the mux (true for epoll)
+                        (setf my-task
+                              (progn
+                                (unless io-tasks
+                                  (setf io-tasks
+                                        (iomux:harvest-events
+                                         mux *default-connection-timeout*)))
+                                (pop io-tasks)))
+                        (with-lock-held (waiting-fds-lock)
+                          (when (< (+ last-cull-time
+                                      *default-connection-timeout*)
+                                   (get-universal-time))
+                            (loop for fd being the hash-key of waiting-fds
+                               using (hash-value state) do
+                               (when (< (+ (car state)
+                                           *default-connection-timeout*)
+                                        (get-universal-time))
+                                 (close-epoll-connection fd)
+                                 (remhash fd waiting-fds)
+                                 (when (eql fd (car my-task))
+                                   (setf my-task nil))))
+                            (setf last-cull-time (get-universal-time)))
+                          (setf fd-buffer
+                                (cdr (gethash (car my-task) waiting-fds)))
+                          (remhash (car my-task) waiting-fds))
+                        ;; TODO: if we're not using epoll (ONESHOT),
+                        ;; need to turn off events on this fd
+                        )
+                   (when my-task
+                     (if (member :error (cdr my-task))
+                         (close-epoll-connection (car my-task))
+                         (ignore-errors
+                           (unwind-protect
+                                (handle-request (car my-task) fd-buffer)
+                             (with-lock-held (waiting-fds-lock)
+                               (setf (gethash (car my-task) waiting-fds)
+                                     (cons (get-universal-time) fd-buffer)))
+                             (iomux:update-fd mux (car my-task)
+                                              '(:read :epoll-oneshot) nil)
+                             ))))))))))))
 
 (defvar *request*)
 (defvar *pages* ())
@@ -33,28 +103,27 @@
          (declare (type function handler))
          (funcall handler))))
 
-(defun handle-request (client-connection read-buffer)
+(defun handle-request (fd read-buffer)
   (declare (optimize speed))
-  (let ((*request* (make-request :client-connection client-connection
-                                 :read-buffer read-buffer))
-        (keep-alive? t))
-    (catch 'socket-error
-      (loop do (match-bind
-                   (progn method (+ #\Space) uri (+ #\Space) "HTTP/" http-version (? #\Return))
-                   (read-to-newline client-connection read-buffer nil)
-                 (setf (request-method *request*) method)
-                 (read-headers client-connection read-buffer)
-                 (match-bind (path (or (last) (progn "?" query-string)))
-                     uri
-                   (setf (request-path *request*) path
-                         (request-query-string *request*) query-string)
-                   (iolib:send-to client-connection (dispatch path)))
-                 (if (equalp http-version #.(force-simple-byte-vector "1.0"))
-                     (setf keep-alive? nil)
-                     (ensure-buffers-flushed *request*)))
-         while (and keep-alive?
-                    (iomux:wait-until-fd-ready (iolib:fd-of client-connection)
-                                               :input 5))))))
+  (let ((*request* (make-request :fd fd
+                                 :read-buffer read-buffer)))
+    (match-bind
+        (progn method (+ #\Space) uri (+ #\Space) "HTTP/" http-version (? #\Return))
+        (read-to-newline fd read-buffer nil)
+      (setf (request-method *request*) method)
+      (read-headers fd read-buffer)
+      (match-bind (path (or (last) (progn "?" query-string)))
+          uri
+        (setf (request-path *request*) path
+              (request-query-string *request*) query-string)
+        (let ((response (dispatch path)))
+          (declare (inline isys:%sys-write)
+                   (ftype (function (t t t) fixnum) isys:%sys-write))
+          (cffi:with-pointer-to-vector-data (ptr response)
+            (isys:%sys-write fd ptr (length response)))))
+      (unless (equalp http-version #.(force-simple-byte-vector "1.0"))
+        (ensure-buffers-flushed *request*)
+        t))))
 
 (defmacro defpage (uri-path &body body)
   `(push (cons ,(babel:string-to-octets uri-path) (lambda () ,@body)) *pages*))
@@ -75,7 +144,7 @@
      #.(force-simple-byte-vector "</h1>")))
 
 (defstruct request
-  client-connection
+  fd
   read-buffer
   method
   path
