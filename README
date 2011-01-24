@@ -1,0 +1,29 @@
+HTTP DOHC was a proof-of-concept web server showing the use of NIO
+with native threads in a pure-Common Lisp implementation. In addition,
+it had a novel architecture based around two distinct thread pools,
+the first one doing racing accept() on initial connections to handle
+the initial HTTP request-reply immediately without contention and to
+do incoming request limiting, and a second thread pool servicing
+keep-alive requests off of an epoll/kqueue/select socket list.
+
+It depends on a patched version of IOLib, found at:
+https://github.com/vsedach/iolib-simple-mux
+
+I've since come to the conclusion that programming effort would be
+better spent on improving the performance of Hunchentoot, rather than
+developing a new incompatible web server. If you want to contribute, a
+good place to start is to write a simple kqueue/epoll interface to be
+used with usocket (I'm not a fan of IOLib). That can be used to add an
+NIO-based thread pool to Hunchentoot.
+
+Another thing I don't think is worth doing is manual utf8 byte buffer
+management. That can be accomplished just as efficiently using the
+existing Common Lisp stream abstractions. What's missing is a
+convenient string library that works over utf8 byte streams and
+vectors, and marshalls the implementation's internal string encoding
+into utf8 at compile-time. This would be sort of like rewriting the
+Common Lisp string handling functions to use utf8 internally. John
+Fremlin's irregex package already provides a lot of this. That would
+work great for getting high throughput on utf8 data, but people that
+expect your server to also understand utf16 (like pretty much everyone
+in Asia) will probably be angry at you.
